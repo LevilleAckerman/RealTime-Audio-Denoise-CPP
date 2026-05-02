@@ -57,7 +57,7 @@ target_compile_definitions(denoise_app PRIVATE MODEL_PATH="${CMAKE_SOURCE_DIR}/m
 # --- 4. 链接库 ---
 target_link_libraries(denoise_app PRIVATE ${PORTAUDIO_LIBRARIES})
 
-target_link_libraries(denoise_app PRIVATE winmm dsound ole32 uuid setupapi)
+target_link_libraries(denoise_app PRIVATE winmm dsound ole32 uuid setupapi mmdevapi)
 
 # 如果你手动指定了 ONNX Runtime 路径，取消下面的注释
 if(NOT ONNXRUNTIME_ROOT STREQUAL "")

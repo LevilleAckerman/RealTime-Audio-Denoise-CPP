@@ -6,8 +6,16 @@
 #include <string>
 #include <memory>
 #include <cmath>
+#include <sstream>
 #include <onnxruntime_cxx_api.h>
 #include <portaudio.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <propvarutil.h>
+#endif
 
 #ifndef MODEL_PATH
 #define MODEL_PATH "models/rnnoise.onnx"
@@ -26,6 +34,277 @@ constexpr int DENOISE_STATE_SIZE = 96;
 #define CHECK_ERROR(err) if (err != paNoError) { \
     std::cerr << "PortAudio error: " << Pa_GetErrorText(err) << std::endl; \
     return 1; \
+}
+
+static void EnableUtf8Console() {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+}
+
+static std::wstring GetDefaultAudioDeviceName(EDataFlow flow) {
+#ifdef _WIN32
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool should_uninitialize = SUCCEEDED(hr);
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+    IPropertyStore* property_store = nullptr;
+    std::wstring device_name = L"<unknown>";
+
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+    if (SUCCEEDED(hr) && enumerator != nullptr) {
+        hr = enumerator->GetDefaultAudioEndpoint(flow, eConsole, &device);
+        if (SUCCEEDED(hr) && device != nullptr) {
+            hr = device->OpenPropertyStore(STGM_READ, &property_store);
+            if (SUCCEEDED(hr) && property_store != nullptr) {
+                PROPVARIANT value;
+                PropVariantInit(&value);
+                hr = property_store->GetValue(PKEY_Device_FriendlyName, &value);
+                if (SUCCEEDED(hr) && value.vt == VT_LPWSTR && value.pwszVal != nullptr) {
+                    device_name = value.pwszVal;
+                }
+                PropVariantClear(&value);
+            }
+        }
+    }
+
+    if (property_store != nullptr) {
+        property_store->Release();
+    }
+    if (device != nullptr) {
+        device->Release();
+    }
+    if (enumerator != nullptr) {
+        enumerator->Release();
+    }
+    if (should_uninitialize) {
+        CoUninitialize();
+    }
+
+    return device_name;
+#else
+    return L"<unknown>";
+#endif
+}
+
+static void PrintWideLine(const std::wstring& text) {
+#ifdef _WIN32
+    HANDLE output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output_handle != INVALID_HANDLE_VALUE && output_handle != nullptr) {
+        DWORD written = 0;
+        WriteConsoleW(output_handle, text.c_str(), static_cast<DWORD>(text.size()), &written, nullptr);
+        WriteConsoleW(output_handle, L"\n", 1, &written, nullptr);
+        return;
+    }
+#endif
+    std::wcout << text << std::endl;
+}
+
+static void PrintDefaultAudioDevices() {
+    PaDeviceIndex input_device = Pa_GetDefaultInputDevice();
+    PaDeviceIndex output_device = Pa_GetDefaultOutputDevice();
+
+    if (input_device == paNoDevice) {
+        PrintWideLine(L"Default input device: <none>");
+    } else {
+        std::wstringstream line;
+        line << L"Default input device: "
+             << GetDefaultAudioDeviceName(eCapture)
+             << L" (index " << input_device << L")";
+        PrintWideLine(line.str());
+    }
+
+    if (output_device == paNoDevice) {
+        PrintWideLine(L"Default output device: <none>");
+    } else {
+        std::wstringstream line;
+        line << L"Default output device: "
+             << GetDefaultAudioDeviceName(eRender)
+             << L" (index " << output_device << L")";
+        PrintWideLine(line.str());
+    }
+}
+
+struct AudioDeviceSelection {
+    PaDeviceIndex input_device = paNoDevice;
+    PaDeviceIndex output_device = paNoDevice;
+};
+
+static void PrintAvailableAudioDevices() {
+    int device_count = Pa_GetDeviceCount();
+    if (device_count < 0) {
+        std::cout << "Failed to enumerate PortAudio devices: " << Pa_GetErrorText(device_count) << std::endl;
+        return;
+    }
+
+    std::cout << "\nAvailable audio devices:" << std::endl;
+    for (PaDeviceIndex device_index = 0; device_index < device_count; ++device_index) {
+        const PaDeviceInfo* device_info = Pa_GetDeviceInfo(device_index);
+        if (device_info == nullptr) {
+            continue;
+        }
+
+        const PaHostApiInfo* host_api_info = Pa_GetHostApiInfo(device_info->hostApi);
+
+        std::cout << "  [" << device_index << "] "
+                  << (device_info->name != nullptr ? device_info->name : "<unknown>")
+                  << " | in: " << device_info->maxInputChannels
+                  << " | out: " << device_info->maxOutputChannels
+                  << " | api: "
+                  << (host_api_info && host_api_info->name != nullptr ? host_api_info->name : "<unknown>");
+
+        if (device_index == Pa_GetDefaultInputDevice()) {
+            std::cout << " | default input";
+        }
+        if (device_index == Pa_GetDefaultOutputDevice()) {
+            std::cout << " | default output";
+        }
+
+        std::cout << std::endl;
+    }
+}
+
+static PaDeviceIndex PromptForDeviceIndex(const std::string& prompt, bool need_input, bool need_output) {
+    while (true) {
+        std::cout << prompt;
+        std::string line;
+        std::getline(std::cin, line);
+
+        if (line.empty()) {
+            return paNoDevice;
+        }
+
+        try {
+            int selected = std::stoi(line);
+            PaDeviceIndex device_index = static_cast<PaDeviceIndex>(selected);
+            const PaDeviceInfo* device_info = Pa_GetDeviceInfo(device_index);
+            if (device_info == nullptr) {
+                std::cout << "Invalid device index." << std::endl;
+                continue;
+            }
+
+            if (need_input && device_info->maxInputChannels < 1) {
+                std::cout << "That device has no input channels." << std::endl;
+                continue;
+            }
+
+            if (need_output && device_info->maxOutputChannels < 1) {
+                std::cout << "That device has no output channels." << std::endl;
+                continue;
+            }
+
+            return device_index;
+        } catch (...) {
+            std::cout << "Please enter a valid number, or press Enter to use the default device." << std::endl;
+        }
+    }
+}
+
+static AudioDeviceSelection SelectAudioDevices() {
+    PrintAvailableAudioDevices();
+
+    AudioDeviceSelection selection;
+    selection.input_device = PromptForDeviceIndex(
+        "Select input device index (Enter = default input): ", true, false);
+    selection.output_device = PromptForDeviceIndex(
+        "Select output device index (Enter = default output): ", false, true);
+
+    if (selection.input_device == paNoDevice) {
+        selection.input_device = Pa_GetDefaultInputDevice();
+    }
+
+    if (selection.output_device == paNoDevice) {
+        selection.output_device = Pa_GetDefaultOutputDevice();
+    }
+
+    return selection;
+}
+
+static void PrintSupportedAudioPairs(double sample_rate) {
+    int device_count = Pa_GetDeviceCount();
+    if (device_count < 0) {
+        std::cout << "Failed to enumerate PortAudio devices for pair probing: "
+                  << Pa_GetErrorText(device_count) << std::endl;
+        return;
+    }
+
+    std::cout << "\nSupported input/output device pairs at " << sample_rate << " Hz:" << std::endl;
+    int supported_pair_count = 0;
+
+    for (PaDeviceIndex input_device = 0; input_device < device_count; ++input_device) {
+        const PaDeviceInfo* input_info = Pa_GetDeviceInfo(input_device);
+        if (input_info == nullptr || input_info->maxInputChannels < 1) {
+            continue;
+        }
+
+        PaStreamParameters input_parameters{};
+        input_parameters.device = input_device;
+        input_parameters.channelCount = CHANNELS;
+        input_parameters.sampleFormat = paFloat32;
+        input_parameters.suggestedLatency = input_info->defaultLowInputLatency;
+        input_parameters.hostApiSpecificStreamInfo = nullptr;
+
+        for (PaDeviceIndex output_device = 0; output_device < device_count; ++output_device) {
+            const PaDeviceInfo* output_info = Pa_GetDeviceInfo(output_device);
+            if (output_info == nullptr || output_info->maxOutputChannels < 1) {
+                continue;
+            }
+
+            PaStreamParameters output_parameters{};
+            output_parameters.device = output_device;
+            output_parameters.channelCount = CHANNELS;
+            output_parameters.sampleFormat = paFloat32;
+            output_parameters.suggestedLatency = output_info->defaultLowOutputLatency;
+            output_parameters.hostApiSpecificStreamInfo = nullptr;
+
+            PaError supported = Pa_IsFormatSupported(&input_parameters, &output_parameters, sample_rate);
+            if (supported == paFormatIsSupported) {
+                ++supported_pair_count;
+                std::cout << "  [" << input_device << " -> " << output_device << "] "
+                          << (input_info->name != nullptr ? input_info->name : "<unknown>")
+                          << "  ==>  "
+                          << (output_info->name != nullptr ? output_info->name : "<unknown>")
+                          << std::endl;
+            }
+        }
+    }
+
+    if (supported_pair_count == 0) {
+        std::cout << "  <no supported pairs found>" << std::endl;
+    } else {
+        std::cout << "Total supported pairs: " << supported_pair_count << std::endl;
+    }
+}
+
+static bool ValidateAudioFormat(const AudioDeviceSelection& audio_devices, double sample_rate) {
+    const PaDeviceInfo* input_device_info = Pa_GetDeviceInfo(audio_devices.input_device);
+    const PaDeviceInfo* output_device_info = Pa_GetDeviceInfo(audio_devices.output_device);
+
+    PaStreamParameters input_parameters{};
+    input_parameters.device = audio_devices.input_device;
+    input_parameters.channelCount = CHANNELS;
+    input_parameters.sampleFormat = paFloat32;
+    input_parameters.suggestedLatency = input_device_info ? input_device_info->defaultLowInputLatency : 0.0;
+    input_parameters.hostApiSpecificStreamInfo = nullptr;
+
+    PaStreamParameters output_parameters{};
+    output_parameters.device = audio_devices.output_device;
+    output_parameters.channelCount = CHANNELS;
+    output_parameters.sampleFormat = paFloat32;
+    output_parameters.suggestedLatency = output_device_info ? output_device_info->defaultLowOutputLatency : 0.0;
+    output_parameters.hostApiSpecificStreamInfo = nullptr;
+
+    PaError supported = Pa_IsFormatSupported(&input_parameters, &output_parameters, sample_rate);
+    if (supported != paFormatIsSupported) {
+        std::cerr << "Selected device combination is not supported at "
+                  << sample_rate << " Hz: " << Pa_GetErrorText(supported) << std::endl;
+        return false;
+    }
+
+    return true;
 }
 
 // --- 全局变量 ---
@@ -189,6 +468,8 @@ int paCallback(const void *inputBuffer, void *outputBuffer,
 
 // --- 主函数 ---
 int main() {
+    EnableUtf8Console();
+
     std::cout << "=== Real-Time Audio Denoise (RNNoise ONNX) ===" << std::endl;
 
     // 1. 初始化 ONNX Runtime
@@ -232,18 +513,52 @@ int main() {
     PaError err = Pa_Initialize();
     CHECK_ERROR(err);
 
+    PrintDefaultAudioDevices();
+    PrintSupportedAudioPairs(SAMPLE_RATE);
+
+    AudioDeviceSelection audio_devices = SelectAudioDevices();
+
+    const PaDeviceInfo* input_device_info = Pa_GetDeviceInfo(audio_devices.input_device);
+    const PaDeviceInfo* output_device_info = Pa_GetDeviceInfo(audio_devices.output_device);
+    std::cout << "Using input device: "
+              << (input_device_info && input_device_info->name ? input_device_info->name : "<unknown>")
+              << " (index " << audio_devices.input_device << ")" << std::endl;
+    std::cout << "Using output device: "
+              << (output_device_info && output_device_info->name ? output_device_info->name : "<unknown>")
+              << " (index " << audio_devices.output_device << ")" << std::endl;
+
+    if (!ValidateAudioFormat(audio_devices, SAMPLE_RATE)) {
+        Pa_Terminate();
+        delete g_ort_session;
+        delete g_ort_env;
+        return -1;
+    }
+
     Denoiser denoiser;
 
     PaStream* stream;
-    // 打开默认输入输出设备
-    err = Pa_OpenDefaultStream(&stream,
-                               CHANNELS,          // 输入通道
-                               CHANNELS,          // 输出通道
-                               paFloat32,         // 32位浮点
-                               SAMPLE_RATE,       // 采样率
-                               FRAME_SIZE,        // 帧大小 (10ms)
-                               paCallback,        // 回调函数
-                               &denoiser);        // 用户数据
+    PaStreamParameters input_parameters{};
+    input_parameters.device = audio_devices.input_device;
+    input_parameters.channelCount = CHANNELS;
+    input_parameters.sampleFormat = paFloat32;
+    input_parameters.suggestedLatency = input_device_info ? input_device_info->defaultLowInputLatency : 0.0;
+    input_parameters.hostApiSpecificStreamInfo = nullptr;
+
+    PaStreamParameters output_parameters{};
+    output_parameters.device = audio_devices.output_device;
+    output_parameters.channelCount = CHANNELS;
+    output_parameters.sampleFormat = paFloat32;
+    output_parameters.suggestedLatency = output_device_info ? output_device_info->defaultLowOutputLatency : 0.0;
+    output_parameters.hostApiSpecificStreamInfo = nullptr;
+
+    err = Pa_OpenStream(&stream,
+                        &input_parameters,
+                        &output_parameters,
+                        SAMPLE_RATE,
+                        FRAME_SIZE,
+                        paNoFlag,
+                        paCallback,
+                        &denoiser);
     CHECK_ERROR(err);
 
     std::cout << "Starting audio stream... Press Enter to stop." << std::endl;
