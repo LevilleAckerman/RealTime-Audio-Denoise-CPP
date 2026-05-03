@@ -23,6 +23,7 @@
 - CMake 3.10 或更高
 - vcpkg
 - 已安装 `portaudio`
+- `ffmpeg`（离线模式处理 MP3 前，需要把 `ffmpeg/bin` 加入 PATH）
 
 下面的说明以当前仓库的默认目录结构为例，实际路径请替换为你自己的本地环境：
 

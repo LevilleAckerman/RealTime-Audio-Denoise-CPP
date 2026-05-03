@@ -52,7 +52,10 @@ endif()
 # --- 3. 添加可执行文件 ---
 add_executable(denoise_app src/main.cpp)
 target_include_directories(denoise_app PRIVATE ${PORTAUDIO_INCLUDE_DIRS})
-target_compile_definitions(denoise_app PRIVATE MODEL_PATH="${CMAKE_SOURCE_DIR}/models/rnnoise.onnx")
+target_compile_definitions(denoise_app PRIVATE
+    MODEL_PATH="${CMAKE_SOURCE_DIR}/models/rnnoise.onnx"
+    DATA_DIR="${CMAKE_SOURCE_DIR}/data"
+)
 
 # --- 4. 链接库 ---
 target_link_libraries(denoise_app PRIVATE ${PORTAUDIO_LIBRARIES})
