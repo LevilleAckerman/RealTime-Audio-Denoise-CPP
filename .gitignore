@@ -70,3 +70,5 @@ Testing/
 
 # local audio samples and generated outputs
 data/
+# user-maintained change notes (not tracked)
+docs/USER_CHANGES.md
